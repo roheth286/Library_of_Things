@@ -10,13 +10,16 @@ RESULTS = []
 
 
 def _build_db():
+    import shutil
+    psql_bin = shutil.which("psql") or (r"C:\Program Files\PostgreSQL\15\bin\psql.exe" if os.path.exists(r"C:\Program Files\PostgreSQL\15\bin\psql.exe") else "psql")
     a = psycopg2.connect(dbname="postgres", **ADMIN); a.autocommit = True
     c = a.cursor()
     c.execute(f"DROP DATABASE IF EXISTS {TEST_DB} WITH (FORCE)"); c.execute(f"CREATE DATABASE {TEST_DB}"); a.close()
     env = dict(os.environ, PGPASSWORD="circulend")
     for f in ["01_schema", "02_logic", "03_security", "04_lab"]:
-        subprocess.run(["psql", "-h", "localhost", "-U", "circulend", "-d", TEST_DB, "-q", "-v", "ON_ERROR_STOP=1", "-f",
+        subprocess.run([psql_bin, "-h", "localhost", "-U", "circulend", "-d", TEST_DB, "-q", "-v", "ON_ERROR_STOP=1", "-f",
                         os.path.join(ROOT, "db", f + ".sql")], check=True, env=env, capture_output=True)
+
 
 
 FIXTURE_SQL = """

@@ -4,3 +4,4 @@ pytest>=8.0
 playwright>=1.40   # only for docs/take_screenshots.py
 reportlab>=4.0     # only for report/build_report.py
 matplotlib
+PyJWT>=2.8.0

@@ -1,4 +1,4 @@
-# CircuLend - database-driven community tool & equipment sharing (BCSE302P)
+# Library of Things - database-driven community tool & equipment sharing (BCSE302P)
 PostgreSQL 16 is the primary deliverable; Flask + a single HTML page expose it.
 
     createdb circulend

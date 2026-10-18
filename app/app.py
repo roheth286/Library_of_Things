@@ -1,14 +1,17 @@
-"""CircuLend - thin Flask API. All business rules live in PostgreSQL; this layer authenticates, opens a transaction
+"""Library of Things - thin Flask API. All business rules live in PostgreSQL; this layer authenticates, opens a transaction
 as the right DB role (SET LOCAL ROLE) and returns JSON."""
-import os, sys, contextlib, datetime, decimal
+import os, sys, contextlib, datetime, decimal, re
 from flask import Flask, jsonify, request, session, send_from_directory
 import psycopg2, psycopg2.extras, psycopg2.pool
+import jwt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from racelab import run_race, STRATEGIES
 
 DSN = os.environ.get("DATABASE_URL", "dbname=circulend user=circulend password=circulend host=localhost")
 app = Flask(__name__, static_folder="static", static_url_path="/static")
-app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me")
+app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me-32-bytes-minimum-secret-key!")
+JWT_SECRET = os.environ.get("JWT_SECRET", app.secret_key)
+JWT_ALGORITHM = "HS256"
 pool = psycopg2.pool.ThreadedConnectionPool(2, 20, DSN)
 
 
@@ -56,8 +59,40 @@ def tx(role=None, member_id=None):
         pool.putconn(con)
 
 
+def _create_jwt(user_dict):
+    payload = {
+        "sub": str(user_dict["member_id"]),
+        "member_id": user_dict["member_id"],
+        "name": user_dict["name"],
+        "role": user_dict["role"],
+        "iat": datetime.datetime.now(datetime.timezone.utc),
+        "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def _decode_jwt(token):
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return None
+
+
 def me(required=True, staff=False):
     u = session.get("user")
+    if not u:
+        auth_hdr = request.headers.get("Authorization", "")
+        if auth_hdr.startswith("Bearer "):
+            payload = _decode_jwt(auth_hdr[7:].strip())
+            if payload:
+                u = {"member_id": payload["member_id"], "name": payload["name"], "role": payload["role"]}
+    if not u:
+        token = request.cookies.get("token")
+        if token:
+            payload = _decode_jwt(token)
+            if payload:
+                u = {"member_id": payload["member_id"], "name": payload["name"], "role": payload["role"]}
+
     if required and not u: raise ApiError("Please sign in", 401)
     if staff and (not u or u["role"] not in ("staff", "admin")): raise ApiError("Staff only", 403)
     return u
@@ -70,24 +105,126 @@ def body(*req):
     return d
 
 
+EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
+
+def validate_email_address(email):
+    email = (email or "").strip()
+    if not email:
+        raise ApiError("Email address is required")
+    if not EMAIL_REGEX.match(email) or ".." in email:
+        raise ApiError("Invalid email address format")
+    local_part, _, domain = email.partition("@")
+    if not local_part or not domain or "." not in domain or domain.startswith(".") or domain.endswith("."):
+        raise ApiError("Invalid email address format")
+    return email.lower()
+
+
+def validate_password_policy(pw):
+    if not pw or len(pw) < 8:
+        raise ApiError("Password must be at least 8 characters long")
+    if not re.search(r'\d', pw):
+        raise ApiError("Password must contain at least one numeric digit (0-9)")
+    if not re.search(r'[A-Z]', pw):
+        raise ApiError("Password must contain at least one uppercase letter (A-Z)")
+    if not re.search(r'[a-z]', pw):
+        raise ApiError("Password must contain at least one lowercase letter (a-z)")
+    if not re.search(r'[!@#$%^&*(),.?":{}|<>]', pw):
+        raise ApiError("Password must contain at least one special character")
+
+
 # ───────── auth ─────────
+@app.post("/api/register")
+def register():
+    d = body("name", "email", "password", "confirm_password")
+    name = d["name"].strip()
+    if not name:
+        raise ApiError("Name is required")
+    email = validate_email_address(d["email"])
+    pw = d["password"]
+    cpw = d["confirm_password"]
+
+    if pw != cpw:
+        raise ApiError("Passwords do not match")
+    validate_password_policy(pw)
+
+    # Public registration strictly forces role to 'member'
+    # Any role provided in body is ignored or rejected if attempting admin
+    if d.get("role") and d.get("role") not in ("member", "user"):
+        raise ApiError("Public registration is only permitted for regular members", 403)
+
+    with tx() as c:
+        c.execute("SELECT 1 FROM members WHERE lower(email) = lower(%s)", (email,))
+        if c.fetchone():
+            raise ApiError("An account with this email address already exists", 409)
+
+        c.execute(
+            "INSERT INTO members(name, email, password_hash, role) VALUES (%s, %s, crypt(%s, gen_salt('bf')), 'member') RETURNING member_id, name, email, role",
+            (name, email, pw)
+        )
+        new_user = dict(c.fetchone())
+
+    return jsonify(ok=True, message="Registration successful. Please sign in.", user={"member_id": new_user["member_id"], "name": new_user["name"], "role": new_user["role"]}), 201
+
+
 @app.post("/api/login")
 def login():
     d = body("email", "password")
+    email = (d["email"] or "").strip().lower()
+    selected_role = (d.get("role") or "").strip()
+
     with tx() as c:
         c.execute("SELECT member_id, name, role FROM members WHERE lower(email)=lower(%s) AND active AND password_hash = crypt(%s, password_hash)",
-                  (d["email"], d["password"]))
+                  (email, d["password"]))
         u = c.fetchone()
-    if not u: raise ApiError("Wrong e-mail or password", 401)
-    session["user"] = dict(u); return jsonify(u)
+    if not u:
+        raise ApiError("Wrong e-mail or password", 401)
+
+    u_dict = dict(u)
+    # Role validation if role selector provided
+    if selected_role:
+        expected_role = selected_role.lower()
+        # map 'user' / 'member'
+        if expected_role in ("user", "member"):
+            if u_dict["role"] not in ("member", "user"):
+                raise ApiError(f"Account does not match the selected '{selected_role}' role", 403)
+        elif expected_role == "admin":
+            if u_dict["role"] != "admin":
+                raise ApiError("Account does not have administrator privileges", 403)
+        elif expected_role == "staff":
+            if u_dict["role"] not in ("staff", "admin"):
+                raise ApiError("Account does not have staff privileges", 403)
+        elif u_dict["role"] != expected_role:
+            raise ApiError(f"Account does not match the selected '{selected_role}' role", 403)
+
+    token = _create_jwt(u_dict)
+    session["user"] = u_dict
+
+    resp = jsonify(dict(u_dict, token=token))
+    # Set HttpOnly cookie
+    is_secure = request.is_secure or request.headers.get("X-Forwarded-Proto") == "https"
+    resp.set_cookie(
+        "token",
+        token,
+        httponly=True,
+        secure=is_secure,
+        samesite="Lax",
+        max_age=86400,
+        path="/"
+    )
+    return resp
 
 
 @app.post("/api/logout")
-def logout(): session.clear(); return jsonify(ok=True)
+def logout():
+    session.clear()
+    resp = jsonify(ok=True)
+    resp.delete_cookie("token", path="/")
+    return resp
 
 
 @app.get("/api/me")
-def whoami(): return jsonify(session.get("user"))
+def whoami():
+    return jsonify(me(required=False))
 
 
 @app.get("/api/demo-accounts")
@@ -97,6 +234,7 @@ def demo_accounts():
                      (SELECT name,email,role FROM members WHERE role='staff' ORDER BY member_id LIMIT 1) UNION ALL
                      (SELECT name,email,role FROM members WHERE role='member' ORDER BY member_id LIMIT 3)""")
         return jsonify(c.fetchall())
+
 
 
 # ───────── catalogue ─────────
