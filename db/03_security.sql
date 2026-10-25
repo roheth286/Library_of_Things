@@ -23,7 +23,7 @@ GRANT SELECT ON categories, tools, tool_units, kits, kit_components,
       TO circulend_member, circulend_staff;
 GRANT SELECT ON reservations, loans, waitlists, notifications, deposits TO circulend_member, circulend_staff;
 GRANT UPDATE (read) ON notifications TO circulend_member, circulend_staff;
-GRANT EXECUTE ON FUNCTION sp_reserve(int,int,int,date,int), sp_cancel_reservation(int), fn_unit_free(int,date,int)
+GRANT EXECUTE ON FUNCTION sp_reserve(int,int,int,date,int), sp_reserve_kit(int,int,date,int), sp_cancel_reservation(int), fn_unit_free(int,date,int), sp_cancel_waitlist(int)
       TO circulend_member, circulend_staff;
 
 -- staff: everything operational + reports
@@ -31,7 +31,7 @@ GRANT SELECT ON members, damage_reports, audit_log, settings,
                v_deposit_holds, v_waitlist_by_tool, v_overdue_loans, v_tool_utilisation TO circulend_staff;
 GRANT EXECUTE ON FUNCTION sp_checkout(int,int,int,int), sp_checkout_kit(int,int,int),
       sp_checkin(int,severity_level,text), sp_release_deposit(int), sp_forfeit_deposit(int),
-      sp_complete_repair(int), sp_expire_reservations(), sp_mark_overdue() TO circulend_staff;
+      sp_complete_repair(int), sp_expire_reservations(), sp_mark_overdue(), sp_promote_waitlist(int) TO circulend_staff;
 GRANT INSERT ON damage_reports TO circulend_staff;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO circulend_staff;
 

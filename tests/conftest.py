@@ -10,16 +10,15 @@ RESULTS = []
 
 
 def _build_db():
-    import shutil
-    psql_bin = shutil.which("psql") or (r"C:\Program Files\PostgreSQL\15\bin\psql.exe" if os.path.exists(r"C:\Program Files\PostgreSQL\15\bin\psql.exe") else "psql")
     a = psycopg2.connect(dbname="postgres", **ADMIN); a.autocommit = True
     c = a.cursor()
     c.execute(f"DROP DATABASE IF EXISTS {TEST_DB} WITH (FORCE)"); c.execute(f"CREATE DATABASE {TEST_DB}"); a.close()
-    env = dict(os.environ, PGPASSWORD="circulend")
+    con = psycopg2.connect(dbname=TEST_DB, **ADMIN); con.autocommit = True
+    cur = con.cursor()
     for f in ["01_schema", "02_logic", "03_security", "04_lab"]:
-        subprocess.run([psql_bin, "-h", "localhost", "-U", "circulend", "-d", TEST_DB, "-q", "-v", "ON_ERROR_STOP=1", "-f",
-                        os.path.join(ROOT, "db", f + ".sql")], check=True, env=env, capture_output=True)
-
+        with open(os.path.join(ROOT, "db", f + ".sql"), "r", encoding="utf-8") as sf:
+            cur.execute(sf.read())
+    con.close()
 
 
 FIXTURE_SQL = """
@@ -28,12 +27,13 @@ TRUNCATE audit_log, notifications, damage_reports, deposits, loans, reservations
 UPDATE settings SET value='24' WHERE key='deposit_hold_hours';
 INSERT INTO categories(name) VALUES ('Power Tools'),('Camping');
 INSERT INTO members(name,email,password_hash,role,max_loans) VALUES
- ('Staff One','staff@t.in',crypt('pw',gen_salt('bf')),'staff',6),          -- 1
- ('Alice','alice@t.in',crypt('pw',gen_salt('bf')),'member',4),             -- 2
- ('Bob','bob@t.in',crypt('pw',gen_salt('bf')),'member',4),                 -- 3
- ('Cara','cara@t.in',crypt('pw',gen_salt('bf')),'member',4),               -- 4
+ ('Staff One','staff@t.in',crypt('pw',gen_salt('bf')),'staff',NULL),          -- 1
+ ('Alice','alice@t.in',crypt('pw',gen_salt('bf')),'member',NULL),             -- 2
+ ('Bob','bob@t.in',crypt('pw',gen_salt('bf')),'member',NULL),                 -- 3
+ ('Cara','cara@t.in',crypt('pw',gen_salt('bf')),'member',NULL),               -- 4
  ('Dan','dan@t.in',crypt('pw',gen_salt('bf')),'member',2),                 -- 5 (low limit)
- ('Eve','eve@t.in',crypt('pw',gen_salt('bf')),'member',4);                 -- 6
+ ('Eve','eve@t.in',crypt('pw',gen_salt('bf')),'member',NULL),
+ ('Admin','admin@t.in',crypt('pw',gen_salt('bf')),'admin',NULL);                 -- 6
 INSERT INTO tools(name,category_id,deposit_amount,max_loan_days) VALUES
  ('Drill',1,1500,7),      -- 1 : 3 units
  ('Washer',1,3500,3),     -- 2 : 1 unit  (scarce → waitlist)

@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:16
+    container_name: library_of_things_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-circulend}
+      POSTGRES_USER: ${POSTGRES_USER:-circulend}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-circulend}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - library_of_things_pgdata:/var/lib/postgresql/data
+      - ./db/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./db/02_logic.sql:/docker-entrypoint-initdb.d/02_logic.sql:ro
+      - ./db/03_security.sql:/docker-entrypoint-initdb.d/03_security.sql:ro
+      - ./db/04_lab.sql:/docker-entrypoint-initdb.d/04_lab.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-circulend} -d ${POSTGRES_DB:-circulend}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  library_of_things_pgdata:
+    name: library_of_things_pgdata

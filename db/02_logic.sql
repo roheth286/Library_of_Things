@@ -31,7 +31,7 @@ BEGIN
   IF TG_OP = 'INSERT' THEN
     SELECT * INTO m FROM members WHERE member_id = NEW.member_id FOR UPDATE;   -- serialises same-member checkouts
     IF NOT m.active THEN RAISE EXCEPTION 'Member % is inactive', m.member_id USING ERRCODE = 'P0001'; END IF;
-    IF m.active_loans_count >= m.max_loans THEN
+    IF m.max_loans IS NOT NULL AND m.active_loans_count >= m.max_loans THEN
       RAISE EXCEPTION 'Loan limit reached (% of % items)', m.active_loans_count, m.max_loans USING ERRCODE = 'P0001';
     END IF;
     UPDATE members SET active_loans_count = active_loans_count + 1 WHERE member_id = NEW.member_id;
@@ -40,6 +40,7 @@ BEGIN
   END IF;
   RETURN NEW;
 END $$;
+DROP TRIGGER IF EXISTS loan_counts ON loans;
 CREATE TRIGGER loan_counts BEFORE INSERT OR UPDATE ON loans FOR EACH ROW EXECUTE FUNCTION trg_loan_counts();
 
 -- (T2) damage report → automatically updates condition/status of the unit (no staff intervention)
@@ -54,6 +55,7 @@ BEGIN
   END IF;
   RETURN NEW;
 END $$;
+DROP TRIGGER IF EXISTS damage_flag ON damage_reports;
 CREATE TRIGGER damage_flag AFTER INSERT ON damage_reports FOR EACH ROW EXECUTE FUNCTION trg_damage_flag();
 
 -- (T3) waitlist cascade: whenever a unit becomes Available, promote the head of that tool's waitlist
@@ -88,6 +90,7 @@ BEGIN
   END IF;
   RETURN NULL;
 END $$;
+DROP TRIGGER IF EXISTS unit_available ON tool_units;
 CREATE TRIGGER unit_available AFTER UPDATE OF status ON tool_units
   FOR EACH ROW EXECUTE FUNCTION trg_unit_available();
 
@@ -103,8 +106,11 @@ BEGIN
           CASE WHEN TG_OP <> 'DELETE' THEN to_jsonb(NEW) END);
   RETURN NULL;
 END $$;
+DROP TRIGGER IF EXISTS audit_loans ON loans;
 CREATE TRIGGER audit_loans    AFTER INSERT OR UPDATE OR DELETE ON loans         FOR EACH ROW EXECUTE FUNCTION trg_audit('loan_id');
+DROP TRIGGER IF EXISTS audit_units ON tool_units;
 CREATE TRIGGER audit_units    AFTER UPDATE                      ON tool_units    FOR EACH ROW EXECUTE FUNCTION trg_audit('unit_id');
+DROP TRIGGER IF EXISTS audit_deposits ON deposits;
 CREATE TRIGGER audit_deposits AFTER INSERT OR UPDATE            ON deposits      FOR EACH ROW EXECUTE FUNCTION trg_audit('deposit_id');
 
 -- ───────────────────────── stored procedures ─────────────────────────
@@ -122,7 +128,8 @@ BEGIN
   IF NOT FOUND THEN RAISE EXCEPTION 'Unknown tool'; END IF;
   IF p_days > t.max_loan_days THEN RAISE EXCEPTION '% can be borrowed for at most % days', t.name, t.max_loan_days; END IF;
   IF p_from < current_date THEN RAISE EXCEPTION 'Cannot reserve for a past date'; END IF;
-  IF (SELECT count(*) FROM reservations r WHERE r.member_id = p_member AND r.status = 'Active')
+  IF m.max_loans IS NOT NULL AND
+     (SELECT count(*) FROM reservations r WHERE r.member_id = p_member AND r.status = 'Active')
      + m.active_loans_count >= m.max_loans THEN
     RAISE EXCEPTION 'Reservation + loan limit reached for this member';
   END IF;
@@ -219,6 +226,64 @@ BEGIN
   RETURN loans_made;
 END $$;
 
+
+-- Kit reservation: reserve one free unit for EVERY component of the kit, or fail atomically
+CREATE OR REPLACE FUNCTION sp_reserve_kit(p_kit int, p_member int, p_from date DEFAULT current_date, p_days int DEFAULT 3)
+RETURNS int[] LANGUAGE plpgsql AS $$
+DECLARE
+  k kits%ROWTYPE;
+  c record;
+  m members%ROWTYPE;
+  picked int;
+  res_ids int[] := '{}';
+  comp_count int;
+  r_id int;
+  hold_hours int;
+BEGIN
+  SELECT * INTO k FROM kits WHERE kit_id = p_kit;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Unknown kit'; END IF;
+
+  SELECT * INTO m FROM members WHERE member_id = p_member;
+  IF NOT FOUND OR NOT m.active THEN RAISE EXCEPTION 'Unknown or inactive member'; END IF;
+
+  SELECT count(*) INTO comp_count FROM kit_components WHERE kit_id = p_kit;
+  IF comp_count = 0 THEN RAISE EXCEPTION 'Kit has no components'; END IF;
+
+  IF m.max_loans IS NOT NULL AND
+     (SELECT count(*) FROM reservations r WHERE r.member_id = p_member AND r.status = 'Active')
+     + m.active_loans_count + comp_count > m.max_loans THEN
+    RAISE EXCEPTION 'Reserving this kit (% items) would exceed your loan and reservation limit (% of %)',
+      comp_count, (SELECT count(*) FROM reservations r WHERE r.member_id = p_member AND r.status = 'Active') + m.active_loans_count, m.max_loans;
+  END IF;
+
+  IF p_from < current_date THEN RAISE EXCEPTION 'Cannot reserve for a past date'; END IF;
+
+  hold_hours := setting_int('reservation_hold_hours');
+
+  FOR c IN SELECT kc.tool_id, t.name, t.max_loan_days FROM kit_components kc JOIN tools t USING (tool_id) WHERE kc.kit_id = p_kit ORDER BY kc.tool_id LOOP
+    IF p_days > c.max_loan_days THEN
+      RAISE EXCEPTION '% can be borrowed for at most % days', c.name, c.max_loan_days;
+    END IF;
+
+    SELECT tu.unit_id INTO picked FROM tool_units tu
+     WHERE tu.tool_id = c.tool_id AND fn_unit_free(tu.unit_id, p_from, p_days)
+     ORDER BY tu.unit_no LIMIT 1 FOR UPDATE SKIP LOCKED;
+
+    IF picked IS NULL THEN
+      RAISE EXCEPTION 'Kit "%" is unavailable: no free unit of "%"', k.name, c.name USING ERRCODE = 'P0002';
+    END IF;
+
+    INSERT INTO reservations(unit_id, member_id, reserved_for_date, duration_days, expires_at, source)
+    VALUES (picked, p_member, p_from, p_days, (p_from::timestamp + make_interval(hours => hold_hours)), 'kit')
+    RETURNING reservation_id INTO r_id;
+
+    res_ids := res_ids || r_id;
+  END LOOP;
+
+  PERFORM notify(p_member, 'Reserved kit "' || k.name || '" (' || comp_count || ' items)', 'reservation');
+  RETURN res_ids;
+END $$;
+
 -- Check-in: closes loan, computes late fee, records optional damage, decides unit state, fires the cascade
 CREATE OR REPLACE FUNCTION sp_checkin(p_loan int, p_severity severity_level DEFAULT NULL, p_notes text DEFAULT NULL)
 RETURNS TABLE(late_days int, late_fee numeric, unit_state text, deposit_state text) LANGUAGE plpgsql AS $$
@@ -304,7 +369,7 @@ BEGIN
 END $$;
 
 -- ───────────────────────── views / reports ─────────────────────────
-CREATE VIEW v_tool_availability AS
+CREATE OR REPLACE VIEW v_tool_availability AS
 SELECT t.tool_id, t.name, c.name AS category, t.deposit_amount, t.max_loan_days,
        count(u.*)                                          AS total_units,
        count(*) FILTER (WHERE u.status = 'Available')       AS available_units,
@@ -316,7 +381,7 @@ FROM tools t JOIN categories c USING (category_id) LEFT JOIN tool_units u USING 
 GROUP BY t.tool_id, c.name;
 
 -- A kit is available only if EVERY component tool has at least one free unit
-CREATE VIEW v_kit_availability AS
+CREATE OR REPLACE VIEW v_kit_availability AS
 SELECT k.kit_id, k.name, k.description,
        count(kc.tool_id)                                                       AS components,
        count(*) FILTER (WHERE a.available_units > 0)                           AS components_available,
@@ -327,7 +392,7 @@ LEFT JOIN kit_components kc USING (kit_id)
 LEFT JOIN v_tool_availability a ON a.tool_id = kc.tool_id
 GROUP BY k.kit_id;
 
-CREATE VIEW v_fleet_status AS
+CREATE OR REPLACE VIEW v_fleet_status AS
 SELECT c.name AS category,
        count(*) FILTER (WHERE u.status = 'Available') AS available,
        count(*) FILTER (WHERE u.status = 'Reserved')  AS reserved,
@@ -337,37 +402,85 @@ SELECT c.name AS category,
 FROM categories c JOIN tools t USING (category_id) JOIN tool_units u USING (tool_id)
 GROUP BY c.name;
 
-CREATE VIEW v_deposit_holds AS
+CREATE OR REPLACE VIEW v_deposit_holds AS
 SELECT d.deposit_id, d.loan_id, m.name AS member, t.name AS tool, d.amount, d.status,
        l.return_date,
        (l.return_date IS NOT NULL
          AND now() >= l.return_date::timestamp + make_interval(hours => setting_int('deposit_hold_hours'))
-         AND NOT EXISTS (SELECT 1 FROM damage_reports x WHERE x.loan_id = l.loan_id AND x.severity <> 'Minor')) AS releasable
+         AND NOT EXISTS (SELECT 1 FROM damage_reports x WHERE x.loan_id = l.loan_id AND x.severity <> 'Minor')) AS releasable,
+       l.due_date,
+       EXISTS (SELECT 1 FROM damage_reports x WHERE x.loan_id = l.loan_id AND x.severity IN ('Moderate','Major','Critical')) AS has_damage
 FROM deposits d JOIN loans l USING (loan_id) JOIN members m USING (member_id)
 JOIN tool_units u USING (unit_id) JOIN tools t USING (tool_id);
 
-CREATE VIEW v_waitlist_by_tool AS
+CREATE OR REPLACE VIEW v_waitlist_by_tool AS
 SELECT t.tool_id, t.name AS tool, count(*) AS waiting, min(w.requested_at) AS longest_wait_since
 FROM waitlists w JOIN tools t USING (tool_id) WHERE w.status = 'Waiting' GROUP BY t.tool_id;
 
-CREATE VIEW v_loan_duration_by_category AS
+CREATE OR REPLACE VIEW v_loan_duration_by_category AS
 SELECT c.name AS category, count(*) AS completed_loans,
        round(avg(l.return_date - l.loan_date)::numeric, 2) AS avg_days_kept,
        round(100.0 * count(*) FILTER (WHERE l.late_fee > 0) / count(*), 1) AS pct_late
 FROM loans l JOIN tool_units u USING (unit_id) JOIN tools t USING (tool_id) JOIN categories c USING (category_id)
 WHERE l.return_date IS NOT NULL GROUP BY c.name;
 
-CREATE VIEW v_overdue_loans AS
+CREATE OR REPLACE VIEW v_overdue_loans AS
 SELECT l.loan_id, m.name AS member, m.contact, t.name AS tool, u.unit_no, l.due_date,
        current_date - l.due_date AS days_overdue,
        (current_date - l.due_date) * setting_int('late_fee_per_day') AS accrued_fee
 FROM loans l JOIN members m USING (member_id) JOIN tool_units u USING (unit_id) JOIN tools t USING (tool_id)
 WHERE l.return_date IS NULL AND l.due_date < current_date;
 
-CREATE VIEW v_tool_utilisation AS
+CREATE OR REPLACE VIEW v_tool_utilisation AS
 SELECT t.name AS tool, count(DISTINCT u.unit_id) AS units,
        count(l.loan_id) AS lifetime_loans,
        round(count(l.loan_id)::numeric / NULLIF(count(DISTINCT u.unit_id),0), 1) AS loans_per_unit,
        t.deposit_amount * count(DISTINCT u.unit_id) AS replacement_value_proxy
 FROM tools t JOIN tool_units u USING (tool_id) LEFT JOIN loans l USING (unit_id)
 GROUP BY t.tool_id ORDER BY lifetime_loans DESC;
+
+-- Admin/Member cancels a waiting entry; shifts remaining queue positions forward
+CREATE OR REPLACE FUNCTION sp_cancel_waitlist(p_waitlist int) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+  w waitlists%ROWTYPE;
+BEGIN
+  SELECT * INTO w FROM waitlists WHERE waitlist_id = p_waitlist FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Waitlist entry % not found', p_waitlist; END IF;
+  IF w.status <> 'Waiting' THEN RAISE EXCEPTION 'Cannot cancel: waitlist entry is already %', w.status; END IF;
+  
+  UPDATE waitlists SET status = 'Cancelled', position = NULL WHERE waitlist_id = p_waitlist;
+  SET CONSTRAINTS uq_waiting_position DEFERRED;
+  UPDATE waitlists SET position = position - 1
+   WHERE tool_id = w.tool_id AND status = 'Waiting' AND position > w.position;
+END $$;
+
+-- Validated promotion of head of waitlist for a tool when a unit is available
+CREATE OR REPLACE FUNCTION sp_promote_waitlist(p_tool int)
+RETURNS TABLE(reservation_id int, member_name text, unit_no int) LANGUAGE plpgsql AS $$
+DECLARE
+  u tool_units%ROWTYPE;
+  w waitlists%ROWTYPE;
+  rid int;
+  m_name text;
+BEGIN
+  SELECT * INTO w FROM waitlists WHERE tool_id = p_tool AND status = 'Waiting'
+   ORDER BY position LIMIT 1;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'No members currently waiting for this equipment';
+  END IF;
+
+  SELECT * INTO u FROM tool_units
+   WHERE tool_id = p_tool AND status = 'Available'
+   ORDER BY unit_no LIMIT 1 FOR UPDATE SKIP LOCKED;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Cannot promote: no available unit of this equipment in circulation';
+  END IF;
+
+  rid := fn_waitlist_cascade(u.unit_id);
+  IF rid IS NULL THEN
+    RAISE EXCEPTION 'Promotion failed: cascade could not complete';
+  END IF;
+
+  SELECT m.name INTO m_name FROM members m WHERE m.member_id = w.member_id;
+  RETURN QUERY SELECT rid, m_name, u.unit_no;
+END $$;

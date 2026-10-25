@@ -34,7 +34,7 @@ CREATE TABLE members (
   role               text NOT NULL DEFAULT 'member' CHECK (role IN ('member','staff','admin')),
   join_date          date NOT NULL DEFAULT current_date,
   active             boolean NOT NULL DEFAULT true,
-  max_loans          int NOT NULL DEFAULT 4 CHECK (max_loans BETWEEN 1 AND 10),
+  max_loans          int CHECK (max_loans IS NULL OR max_loans >= 1),
   active_loans_count int NOT NULL DEFAULT 0 CHECK (active_loans_count >= 0)   -- trigger-maintained (intentional denormalisation)
 );
 

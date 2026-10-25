@@ -1,6 +1,11 @@
 """Library of Things - thin Flask API. All business rules live in PostgreSQL; this layer authenticates, opens a transaction
 as the right DB role (SET LOCAL ROLE) and returns JSON."""
 import os, sys, contextlib, datetime, decimal, re
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 from flask import Flask, jsonify, request, session, send_from_directory
 import psycopg2, psycopg2.extras, psycopg2.pool
 import jwt
@@ -163,7 +168,26 @@ def register():
         )
         new_user = dict(c.fetchone())
 
-    return jsonify(ok=True, message="Registration successful. Please sign in.", user={"member_id": new_user["member_id"], "name": new_user["name"], "role": new_user["role"]}), 201
+    token = _create_jwt(new_user)
+    session["user"] = new_user
+
+    resp = jsonify(
+        ok=True,
+        message=f"Registration successful! Welcome to Library of Things, {new_user['name']}!",
+        user={"member_id": new_user["member_id"], "name": new_user["name"], "role": new_user["role"]},
+        token=token
+    )
+    is_secure = request.is_secure or request.headers.get("X-Forwarded-Proto") == "https"
+    resp.set_cookie(
+        "token",
+        token,
+        httponly=True,
+        secure=is_secure,
+        samesite="Lax",
+        max_age=86400,
+        path="/"
+    )
+    return resp, 201
 
 
 @app.post("/api/login")
@@ -271,13 +295,29 @@ def kits():
         c.execute("SELECT * FROM v_kit_availability ORDER BY name"); return jsonify(c.fetchall())
 
 
+@app.post("/api/kits/<int:kid>/reserve")
+def reserve_kit(kid):
+    u = me()
+    if u["role"] not in ("member", "user"):
+        raise ApiError("Kit reservations are for members only", 403)
+    d = body("date", "days")
+    with tx(u["role"], u["member_id"]) as c:
+        c.execute("SELECT sp_reserve_kit(%s, %s, %s, %s) AS reservations",
+                  (kid, u["member_id"], d["date"], int(d["days"])))
+        res = c.fetchone()
+        return jsonify(ok=True, reservations=res["reservations"])
+
+
 # ───────── member actions ─────────
 @app.post("/api/reserve")
 def reserve():
-    u = me(); d = body("tool_id", "date", "days")
-    member = int(d["member_id"]) if d.get("member_id") and u["role"] != "member" else u["member_id"]
+    u = me()
+    if u["role"] not in ("member", "user"):
+        raise ApiError("Tool reservations are for members only", 403)
+    d = body("tool_id", "date", "days")
+    member = u["member_id"]
     with tx(u["role"], u["member_id"]) as c:
-        c.execute("SELECT * FROM sp_reserve(%s,%s,%s,%s,%s)", (member, d["tool_id"], d.get("unit_id"), d["date"], d["days"]))
+        c.execute("SELECT * FROM sp_reserve(%s,%s,%s,%s,%s)", (member, d["tool_id"], d.get("unit_id"), d["date"], int(d["days"])))
         return jsonify(c.fetchone())
 
 
@@ -292,7 +332,10 @@ def cancel(rid):
 
 @app.get("/api/my")
 def my():
-    u = me(); out = {}
+    u = me()
+    if u["role"] not in ("member", "user"):
+        raise ApiError("Member account is for members only", 403)
+    out = {}
     with tx(u["role"], u["member_id"]) as c:
         mid = u["member_id"]
         c.execute("""SELECT l.loan_id, t.name tool, un.unit_no, l.loan_date, l.due_date, l.return_date, l.status, l.late_fee, d.amount deposit, d.status deposit_status
@@ -365,12 +408,20 @@ def checkout_kit():
 def checkin():
     u = me(staff=True); d = body("loan_id")
     with tx(u["role"], u["member_id"]) as c:
+        c.execute("SELECT unit_id FROM loans WHERE loan_id = %s", (d["loan_id"],))
+        ln = c.fetchone()
+        u_id = ln["unit_id"] if ln else None
+
         c.execute("SELECT * FROM sp_checkin(%s, %s::severity_level, %s)", (d["loan_id"], d.get("severity") or None, d.get("notes")))
         r = c.fetchone()
-        c.execute("""SELECT m.name, t.name AS tool, un.unit_no FROM reservations r JOIN members m USING (member_id)
-                     JOIN tool_units un USING (unit_id) JOIN tools t USING (tool_id)
-                     WHERE r.source='waitlist' AND r.status='Active' AND r.created_at = now() LIMIT 1""")
-        r["promoted"] = c.fetchone()
+        r["promoted"] = None
+        if u_id:
+            c.execute("""SELECT m.name, t.name AS tool, un.unit_no, r.reservation_id
+                         FROM reservations r JOIN members m USING (member_id)
+                         JOIN tool_units un USING (unit_id) JOIN tools t USING (tool_id)
+                         WHERE un.unit_id = %s AND r.source = 'waitlist' AND r.status = 'Active'
+                         ORDER BY r.reservation_id DESC LIMIT 1""", (u_id,))
+            r["promoted"] = c.fetchone()
         return jsonify(r)
 
 
@@ -392,10 +443,106 @@ def repair():
 @app.post("/api/staff/deposit/<action>")
 def deposit(action):
     u = me(staff=True); d = body("loan_id")
-    if action not in ("release", "forfeit"): raise ApiError("Unknown action", 404)
+    if action != "release": raise ApiError("Action not allowed", 400)
     with tx(u["role"], u["member_id"]) as c:
-        c.execute("SELECT sp_release_deposit(%s) AS r" if action == "release" else "SELECT sp_forfeit_deposit(%s) IS NULL AS r", (d["loan_id"],))
+        c.execute("SELECT sp_release_deposit(%s) AS r", (d["loan_id"],))
         return jsonify(c.fetchone())
+
+
+@app.get("/api/staff/waitlists")
+def staff_waitlists():
+    u = me(staff=True)
+    with tx(u["role"], u["member_id"]) as c:
+        c.execute("""
+            SELECT t.tool_id, t.name AS tool, c.name AS category,
+                   t.deposit_amount, t.max_loan_days,
+                   count(u.*) AS total_units,
+                   count(*) FILTER (WHERE u.status = 'Available') AS available_units,
+                   count(*) FILTER (WHERE u.status = 'Loaned') AS loaned_units,
+                   count(*) FILTER (WHERE u.status = 'Reserved') AS reserved_units,
+                   count(*) FILTER (WHERE u.status = 'Repair') AS repair_units,
+                   (SELECT count(*) FROM waitlists w WHERE w.tool_id = t.tool_id AND w.status = 'Waiting') AS waiting_count
+            FROM tools t
+            JOIN categories c USING (category_id)
+            LEFT JOIN tool_units u USING (tool_id)
+            GROUP BY t.tool_id, c.name
+            ORDER BY waiting_count DESC, t.name ASC
+        """)
+        tools = c.fetchall()
+
+        c.execute("""
+            SELECT l.loan_id, l.unit_id, un.unit_no, un.tool_id, t.name AS tool,
+                   m.member_id, m.name AS member, m.email,
+                   l.loan_date, l.due_date,
+                   (l.due_date < current_date) AS is_overdue,
+                   CASE WHEN l.due_date < current_date THEN current_date - l.due_date ELSE 0 END AS days_overdue
+            FROM loans l
+            JOIN tool_units un USING (unit_id)
+            JOIN tools t USING (tool_id)
+            JOIN members m USING (member_id)
+            WHERE l.return_date IS NULL
+            ORDER BY l.due_date ASC
+        """)
+        active_loans = c.fetchall()
+
+        c.execute("""
+            SELECT w.waitlist_id, w.tool_id, t.name AS tool,
+                   w.member_id, m.name AS member, m.email,
+                   w.position, w.status, w.requested_at,
+                   r.reservation_id, r.status AS res_status, r.expires_at AS res_expires_at,
+                   un.unit_no AS res_unit_no
+            FROM waitlists w
+            JOIN tools t USING (tool_id)
+            JOIN members m USING (member_id)
+            LEFT JOIN LATERAL (
+                SELECT r.reservation_id, r.status, r.expires_at, r.unit_id
+                FROM reservations r
+                WHERE r.member_id = w.member_id AND r.source = 'waitlist'
+                ORDER BY r.reservation_id DESC LIMIT 1
+            ) r ON w.status = 'Promoted'
+            LEFT JOIN tool_units un ON un.unit_id = r.unit_id
+            ORDER BY t.name, CASE WHEN w.status = 'Waiting' THEN 0 ELSE 1 END, w.position ASC, w.requested_at ASC
+        """)
+        entries = c.fetchall()
+
+        c.execute("""
+            SELECT w.waitlist_id, t.name AS tool, m.name AS member, m.email,
+                   w.requested_at, r.reservation_id, un.unit_no, r.created_at AS promoted_at,
+                   r.expires_at, r.status AS res_status
+            FROM waitlists w
+            JOIN tools t USING (tool_id)
+            JOIN members m USING (member_id)
+            JOIN reservations r ON r.member_id = w.member_id AND r.source = 'waitlist'
+            JOIN tool_units un ON un.unit_id = r.unit_id
+            WHERE w.status = 'Promoted'
+            ORDER BY r.created_at DESC
+            LIMIT 15
+        """)
+        promotions = c.fetchall()
+
+        return jsonify({
+            "tools": tools,
+            "active_loans": active_loans,
+            "entries": entries,
+            "promotions": promotions
+        })
+
+
+@app.post("/api/staff/waitlist/cancel")
+def staff_cancel_waitlist():
+    u = me(staff=True); d = body("waitlist_id")
+    with tx(u["role"], u["member_id"]) as c:
+        c.execute("SELECT sp_cancel_waitlist(%s)", (d["waitlist_id"],))
+        return jsonify(ok=True, message="Waitlist entry cancelled")
+
+
+@app.post("/api/staff/waitlist/promote")
+def staff_promote_waitlist():
+    u = me(staff=True); d = body("tool_id")
+    with tx(u["role"], u["member_id"]) as c:
+        c.execute("SELECT * FROM sp_promote_waitlist(%s)", (d["tool_id"],))
+        res = c.fetchone()
+        return jsonify(ok=True, promoted=res)
 
 
 @app.post("/api/staff/jobs/<job>")
@@ -415,7 +562,7 @@ def reports():
         out = {}
         for key, sql in {
             "fleet": "SELECT * FROM v_fleet_status ORDER BY category",
-            "deposits": "SELECT * FROM v_deposit_holds WHERE status='Held' ORDER BY loan_id DESC LIMIT 25",
+            "deposits": "SELECT * FROM v_deposit_holds ORDER BY loan_id DESC LIMIT 40",
             "waitlist": "SELECT * FROM v_waitlist_by_tool ORDER BY waiting DESC",
             "duration": "SELECT * FROM v_loan_duration_by_category ORDER BY avg_days_kept DESC",
             "overdue": "SELECT * FROM v_overdue_loans ORDER BY days_overdue DESC",
@@ -424,7 +571,9 @@ def reports():
         }.items():
             c.execute(sql); out[key] = c.fetchall()
         c.execute("""SELECT (SELECT count(*) FROM tool_units) units, (SELECT count(*) FROM members WHERE role='member') members,
-                            (SELECT count(*) FROM loans) loans, (SELECT coalesce(sum(amount),0) FROM deposits WHERE status='Held') held""")
+                            (SELECT count(*) FROM loans) loans,
+                            (SELECT coalesce(sum(amount),0) FROM deposits WHERE status='Held') held,
+                            (SELECT coalesce(sum(amount),0) FROM deposits WHERE status='Released') released""")
         out["totals"] = c.fetchone()
         return jsonify(out)
 

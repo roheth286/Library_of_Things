@@ -1,5 +1,10 @@
 """Seed CircuLend with realistic, deterministic demo data (50 members, 33 tools, 80 units, ~190 loans)."""
 import os, random, sys
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import psycopg2
 
 DSN = os.environ.get("DATABASE_URL", "dbname=circulend user=circulend password=circulend host=localhost")

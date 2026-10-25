@@ -260,7 +260,7 @@
   "scenario": "Release deposit immediately after return (24 h window open)",
   "expected": "Rejected: return window open",
   "group": "Deposits",
-  "actual": "ERROR:  Cannot release: return window open until 2026-10-19 00:00",
+  "actual": "ERROR:  Cannot release: return window open until 2026-10-26 00:00",
   "status": "PASS"
  },
  {
@@ -420,7 +420,7 @@
   "scenario": "Same 2-way race fixed with SERIALIZABLE + retry",
   "expected": "Exactly one booking; loser rejected cleanly",
   "group": "Concurrency",
-  "actual": "bookings=1 outcomes=['BOOKED', 'rejected (unit already Reserved)']",
+  "actual": "bookings=1 outcomes=['rejected (unit already Reserved)', 'BOOKED']",
   "status": "PASS"
  },
  {
